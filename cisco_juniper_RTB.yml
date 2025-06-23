@@ -1,0 +1,246 @@
+- name : "automation_tests Ciso-Juniper!" 
+  hosts : CiscoAndJuniper
+  gather_facts: no 
+  vars:
+    lsp_count: 4000
+#    var1: cr2
+#    var2: jr4
+    var1bis: jr4
+    var2bis: cr2
+
+  tasks:
+    - name: "Définir le timestamp actuel"
+      set_fact:
+        timestamp_now: "{{ lookup('pipe', 'date +%Y-%m-%d_%H-%M') }}"
+
+    - name: "Initialiser la variables (1)"
+      set_fact:
+        capture_name: "cis-ff2jun_LSP{{ lsp_count }}_{{ timestamp_now }}"
+      when: var1 is defined and var2 is defined
+
+    - name: "Initialiser la variables (1bis)"
+      set_fact:
+        capture_name: "jun2cis-ff_LSP{{ lsp_count }}_{{ timestamp_now }}"
+      when : var1bis is defined and var2bis is defined
+
+    - name: "Initialiser la variable (2)"
+      set_fact:
+        result_dir: "/etc/ansible/playbooks4/results_{{ capture_name }}"
+
+    - name: "RTB-Router interface no shutdown (sur R2)"
+      cisco.iosxr.iosxr_interfaces:
+        config:
+          - name : Giga 0/0/0/1
+            enabled: True
+      when :
+        - var1 is defined
+        - inventory_hostname == var1
+
+    - name: "RTB-Router interface no shutdown (sur R4)"
+      junipernetworks.junos.junos_config:
+        lines:
+          - "delete interfaces ge-0/0/1 disable"
+      when :
+        - var1bis is defined
+        - inventory_hostname == var1bis
+
+    - name: "Générer des LSP IS-IS"
+      ansible.builtin.shell:
+        cmd: "lspgen -a 49.0001/24 -C 1921.6800.1001 -m generated_lsp.mrt -c {{lsp_count}} -V 2 -M 65535"
+        chdir: /root/isis
+      when : inventory_hostname == "rtb"
+
+    - name: "Lancer BNG Blaster en arrière-plan"
+      ansible.builtin.shell:
+        cmd: "bngblaster -C currenttest.json -S run.sock"
+        chdir: /root/isis
+      async: 600
+      poll: 0
+      when : inventory_hostname == "rtb"
+
+    - name: "Attendre qlq minute avant d'arrêter BNG Blaster"
+      ansible.builtin.pause:
+        seconds: 600
+
+    - name : "Recuperer le process id de bng"
+      shell:  pgrep -f " bngblaster -C currenttest.json -S run.sock" 
+      register: bng_pid
+      when : inventory_hostname == "rtb"
+
+    - name : "Tuer le process"
+      command:  kill {{bng_pid.stdout[0]}}
+      when: bng_pid.stdout is defined and bng_pid.stdout | length > 0 and inventory_hostname == "rtb"
+
+    - name: "RTB-Router interface shutdown (sur R2)"
+      cisco.iosxr.iosxr_interfaces:
+        config: 
+          - name : Giga 0/0/0/1
+            enabled: False
+      when :
+        - var1 is defined
+        - inventory_hostname == var1
+
+    - name: "RTB-Router interface shutdown (sur R4)"
+      junipernetworks.junos.junos_config:
+        lines:
+          - "set interfaces ge-0/0/1 disable"
+      when :
+        - var1bis is defined
+        - inventory_hostname == var1bis
+
+    - name: "Creer un repertoire local"
+      ansible.builtin.file:
+        path: "{{result_dir}}"
+        state: directory 
+        mode: '0755'
+      delegate_to: localhost
+
+    - name : "saving R2 running configurations" 
+      cisco.iosxr.iosxr_command:
+        commands:
+          - show running-config 
+      register : config_output 
+      when : (var1 is defined and inventory_hostname == var1) or (var2bis is defined and inventory_hostname == var2bis)
+
+    - name : "copying configurations on a file"
+      copy: 
+        content : "{{config_output.stdout[0]}}" 
+        dest : "{{result_dir}}/{{inventory_hostname}}_config.cfg"
+      when : (var1 is defined and inventory_hostname == var1) or (var2bis is defined and inventory_hostname == var2bis)
+      delegate_to: localhost
+
+    - name : "saving R4 running configurations"
+      junos_command: 
+        commands:
+          - show configuration 
+      register : config_output 
+      when : (var2 is defined and inventory_hostname == var2) or (var1bis is defined and inventory_hostname == var1bis)
+
+    - name : "copying configurations on a file" 
+      copy: 
+        content : "{{config_output.stdout[0]}}" 
+        dest : "{{result_dir}}/{{inventory_hostname}}_config.cfg"
+      when : (var2 is defined and inventory_hostname == var2) or (var1bis is defined and inventory_hostname == var1bis)
+      delegate_to: localhost
+
+    - name: "s assurer que l'interface est activé sur R2" 
+      cisco.iosxr.iosxr_interfaces:
+        config: 
+          - name : Giga 0/0/0/0
+            enabled: True
+      when:
+        - var2bis is defined 
+        - inventory_hostname == var2bis
+
+    - name: "s assurer que l'interface est activé sur R4" 
+      junipernetworks.junos.junos_config:
+        lines:
+          - "delete interfaces ge-0/0/0 disable"
+      when:
+        - var2 is defined 
+        - inventory_hostname == var2
+
+    - name: "Starting up tcpdump on port ens5"
+      command: "tcpdump -i ens5 -w {{result_dir}}/{{capture_name}}.pcap" 
+      async: 1000 
+      poll: 0
+      delegate_to: localhost
+
+    - name: " R2-R4 interface UP" 
+      cisco.iosxr.iosxr_interfaces:
+        config: 
+          - name : Giga 0/0/0/0
+            enabled: True 
+      when:
+        - var1 is defined 
+        - inventory_hostname == var1
+
+    - name: " R2-R4 interface UP" 
+      junipernetworks.junos.junos_config:
+        lines:
+          - "delete interfaces ge-0/0/0 disable"
+      when :
+        - var1bis is defined
+        - inventory_hostname == var1bis
+
+    - name: waiting for 300 seconds 
+      pause: 
+        seconds: 600 
+
+    - name : "saving isis database (on cisco)"
+      cisco.iosxr.iosxr_command: 
+        commands: 
+          - show isis database 
+      register: isis_db
+      when : (var1 is defined and inventory_hostname == var1) or (var2bis is defined and inventory_hostname == var2bis)
+
+    - name : "copying databases on /results" 
+      copy : 
+        content : "{{isis_db.stdout[0]}}" 
+        dest : "{{result_dir}}/{{inventory_hostname}}_isis_db.cfg"
+      when : (var1 is defined and inventory_hostname == var1) or (var2bis is defined and inventory_hostname == var2bis)
+      delegate_to: localhost
+
+    - name : "saving isis database (on juniper)" 
+      junos_command: 
+        commands:
+          - show isis database 
+      register: isis_db2_output
+      when : (var2 is defined and inventory_hostname == var2) or (var1bis is defined and inventory_hostname == var1bis)
+
+    - name : "copying databases on /results" 
+      copy : 
+        content : "{{isis_db2_output.stdout[0]}}" 
+        dest : "{{result_dir}}/{{inventory_hostname}}_isis_db.cfg"
+      when : (var2 is defined and inventory_hostname == var2) or (var1bis is defined and inventory_hostname == var1bis)
+      delegate_to: localhost
+
+    - name : "R2-R4 shutdown (cisco)" 
+      cisco.iosxr.iosxr_interfaces: 
+        config:
+          - name : Giga 0/0/0/0 
+            enabled : False 
+      when :
+        - var1 is defined
+        - inventory_hostname == var1
+
+    - name : "R2-R4 shutdown (juniper)"
+      junipernetworks.junos.junos_config:
+        lines:
+          - "delete interfaces ge-0/0/0 disable"
+      when :
+        - var1bis is defined
+        - inventory_hostname == var1bis
+
+    - name : "getting tcpdump pid" 
+      shell: pgrep -f "tcpdump -i ens5" 
+      register: tcpdump_pid
+      delegate_to: localhost
+ 
+    - name : " stoping tcpdump and saving the captured packets" 
+      command: kill {{tcpdump_pid.stdout[0]}}
+      when: tcpdump_pid.stdout is defined and tcpdump_pid.stdout | length > 0
+      delegate_to: localhost
+
+    - name: "Eteindre l interface sur Juniper" 
+      junipernetworks.junos.junos_config:
+        lines:
+          - "set interfaces ge-0/0/0 disable"
+      when :
+        - var2 is defined
+        - inventory_hostname == var2
+
+    - name: "Eteindre l interface sur cisco" 
+      cisco.iosxr.iosxr_interfaces: 
+        config:
+          - name : Giga 0/0/0/0 
+            enabled : False 
+      when : 
+        - var2bis is defined
+        - inventory_hostname == var2bis
+
+    - name: "Parser le .pcap en txt"
+      shell: >
+        tshark -V -r {{ result_dir }}/{{ capture_name }}.pcap > {{ result_dir }}/{{ capture_name }}_txt.txt
+      delegate_to: localhost
+
